@@ -1,0 +1,47 @@
+{
+  "manifest_version": 2,
+  "id": "local.oopz-voice",
+  "version": "0.1.0",
+  "name": "OOPZ 语音桥",
+  "description": "把 OOPZ 语音频道接进麦麦：语音转写注入 MaiBot，回复交给语音桥 TTS 播回频道。",
+  "author": {
+    "name": "local",
+    "url": "https://github.com/Mai-with-u/MaiBot"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/Mai-with-u/MaiBot",
+    "homepage": "https://github.com/Mai-with-u/MaiBot",
+    "documentation": "https://github.com/Mai-with-u/MaiBot",
+    "issues": "https://github.com/Mai-with-u/MaiBot/issues"
+  },
+  "plugin_type": "adapter",
+  "host_application": {
+    "min_version": "1.3.0",
+    "max_version": "1.9.99"
+  },
+  "sdk": {
+    "min_version": "2.5.0",
+    "max_version": "9.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "websockets",
+      "version_spec": ">=12.0"
+    }
+  ],
+  "capabilities": ["send.text"],
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "mic",
+      "fallback": "audio-lines",
+      "background": "#5865f2"
+    }
+  },
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": ["zh-CN"]
+  }
+}
