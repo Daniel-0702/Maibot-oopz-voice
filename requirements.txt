@@ -1,0 +1,5 @@
+oopz-sdk>=0.16.0
+playwright>=1.40
+aiohttp>=3.9
+numpy>=1.26
+edge-tts>=6.1

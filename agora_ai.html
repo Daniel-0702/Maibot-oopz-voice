@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>OOPZ AI Voice Bridge</title>
+<style>
+  body { font: 12px/1.5 ui-monospace, Consolas, monospace; background:#0f1115; color:#cfd6e4; padding:10px; }
+  pre { white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+<pre id="log">[boot] loading...</pre>
+<script>
+(() => {
+"use strict";
+
+/* =====================================================================
+ * OOPZ AI 语音桥（浏览器侧）
+ *
+ * 职责只有四件事：
+ *   1. join   —— 用 OOPZ 下发的 Agora token 进语音房（mode=live / role=host）
+ *   2. speak  —— 常驻一条自定义音轨，把 Python 推来的 PCM 直接播进房间
+ *   3. listen —— 订阅房间里其他人的 audio track，抓成 16k PCM 回传 Python
+ *   4. bridge —— 把 OOPZ 的 uid<->Agora uid 身份映射发出去（否则别人不认你）
+ *
+ * 与 Python 之间走本机 WebSocket：
+ *   浏览器 -> Python  二进制: [u8 kind=1][u32 agoraUid LE][u32 seq LE][s16le 16k]
+ *   浏览器 -> Python  文本  : {"type":"joined"|"identity"|"hello"|"log", ...}
+ *   Python -> 浏览器  二进制: 裸 s16le 48k 单声道（直接进播放环形缓冲）
+ *   Python -> 浏览器  文本  : {"type":"flush"} 丢掉未播完的音频（打断用）
+ * ===================================================================== */
+
+const OUT_RATE = 48000;   // 播给 Agora 的采样率
+const IN_RATE  = 16000;   // 从 Agora 抓给 ASR 的采样率
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+const WS_URL = window.AGORA_WS_URL ||
+  ((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/agora" +
+    (TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""));
+
+const out = document.getElementById("log");
+const log = (...a) => {
+  const s = a.map(x => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
+  out.textContent = (out.textContent + "\n" + s).slice(-6000);
+  console.log("[bridge]", ...a);
+};
+window.__aiLog = log;
+
+let client = null;
+let ws = null, wsOpening = null;
+let joined = false;
+let playCtx = null, playNode = null, playDest = null, playTrack = null;
+let capCtx = null, capSink = null;
+const capture = new Map();     // agoraUid -> { source, node }
+const identity = new Map();    // agoraUid -> oopzUid
+let currentOopzUid = null;
+let currentAgoraUid = null;
+let seq = 0;
+let identityTimer = null;
+const activeSources = new Set();   // 正在播放的 TTS AudioBufferSourceNode
+let speakId = 0;
+const stats = { rx: 0, tx: 0, rxBytes: 0, txBytes: 0, wsOpen: false, spoken: 0 };
+
+/* ------------------------------------------------------------------ WS */
+function sendJson(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function connectWs() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return wsOpening || Promise.resolve();
+  }
+  wsOpening = new Promise((resolve) => {
+    try { ws = new WebSocket(WS_URL); }
+    catch (e) { setTimeout(connectWs, 1000); resolve(); return; }
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => {
+      stats.wsOpen = true;
+      sendJson({ type: "hello", inRate: IN_RATE, outRate: OUT_RATE });
+      log("[ws] open", WS_URL);
+      resolve();
+    };
+    ws.onclose = () => {
+      stats.wsOpen = false; wsOpening = null;
+      log("[ws] closed, retry in 1s");
+      setTimeout(connectWs, 1000);
+    };
+    ws.onerror = () => { try { ws.close(); } catch (_) {} };
+    ws.onmessage = async (ev) => {
+      if (typeof ev.data === "string") {
+        let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+        if (m.type === "flush") {
+          flushSpeech();
+          log("[play] flush");
+          return;
+        }
+        if (m.type === "speak") {
+          const r = await speakMp3(m.data, m.id);
+          sendJson({ type: "speak_done", id: r.id || null, duration: r.duration || 0, ok: !!r.ok, error: r.error || "" });
+          return;
+        }
+        return;
+      }
+      await playPcm(ev.data);
+    };
+  });
+  return wsOpening;
+}
+
+/* --------------------------------------------------- AudioWorklet 源码 */
+// 播放：环形缓冲，静音时输出 0，永不 underrun 爆音
+function playerWorklet() {
+  class PCMPlayer extends AudioWorkletProcessor {
+    constructor() {
+      super();
+      this.size = 48000 * 30;             // 30 秒上限：流式 TTS 可能一秒内推完几秒音频
+      this.buf = new Float32Array(this.size);
+      this.r = 0; this.w = 0;
+      this.port.onmessage = (e) => {
+        const d = e.data;
+        if (d.type === "flush") { this.r = this.w = 0; return; }
+        if (d.type === "pcm") this.push(d.samples);
+      };
+    }
+    push(s) {
+      const n = s.length;
+      for (let i = 0; i < n; i++) {
+        this.buf[this.w] = s[i];
+        this.w = (this.w + 1) % this.size;
+        if (this.w === this.r) this.r = (this.r + 1) % this.size; // 满了丢最旧
+      }
+    }
+    process(inputs, outputs) {
+      const ch = outputs[0][0];
+      for (let i = 0; i < ch.length; i++) {
+        if (this.r !== this.w) { ch[i] = this.buf[this.r]; this.r = (this.r + 1) % this.size; }
+        else { ch[i] = 0; }
+      }
+      return true;
+    }
+  }
+  registerProcessor("pcm-player", PCMPlayer);
+}
+
+// 抓取：每 20ms（16000*0.02=320 样本）打成一包 Int16 回传
+function captureWorklet() {
+  class PCMCapture extends AudioWorkletProcessor {
+    constructor(options) {
+      super();
+      this.chunk = new Float32Array(320);
+      this.n = 0;
+      this.port.onmessage = () => { this.n = 0; };
+    }
+    process(inputs) {
+      const input = inputs[0];
+      if (!input || !input[0]) return true;
+      const ch = input[0];
+      for (let i = 0; i < ch.length; i++) {
+        this.chunk[this.n++] = ch[i];
+        if (this.n >= 320) {
+          const i16 = new Int16Array(320);
+          for (let k = 0; k < 320; k++) {
+            let v = this.chunk[k];
+            v = v < -1 ? -1 : (v > 1 ? 1 : v);
+            i16[k] = v < 0 ? (v * 32768) : (v * 32767);
+          }
+          this.n = 0;
+          this.port.postMessage(i16.buffer, [i16.buffer]);
+        }
+      }
+      return true;
+    }
+  }
+  registerProcessor("pcm-capture", PCMCapture);
+}
+
+/* ------------------------------------------------------- 播放 / 抓取 init */
+async function ensurePlayback() {
+  if (playCtx) return;
+  playCtx = new AudioContext({ sampleRate: OUT_RATE, latencyHint: "interactive" });
+  await playCtx.resume();
+  const src = "(" + playerWorklet.toString() + ")();";
+  const url = URL.createObjectURL(new Blob([src], { type: "application/javascript" }));
+  await playCtx.audioWorklet.addModule(url);
+  playNode = new AudioWorkletNode(playCtx, "pcm-player");
+  playDest = playCtx.createMediaStreamDestination();
+  playNode.connect(playDest);
+  log("[play] worklet ready @", playCtx.sampleRate);
+}
+
+async function ensureCapture() {
+  if (capCtx) return;
+  capCtx = new AudioContext({ sampleRate: IN_RATE, latencyHint: "interactive" });
+  await capCtx.resume();
+  const src = "(" + captureWorklet.toString() + ")();";
+  const url = URL.createObjectURL(new Blob([src], { type: "application/javascript" }));
+  await capCtx.audioWorklet.addModule(url);
+  // 静音汇：把抓取节点拉起来，但不真的放出来
+  capSink = capCtx.createGain();
+  capSink.gain.value = 0;
+  capSink.connect(capCtx.destination);
+  log("[cap] worklet ready @", capCtx.sampleRate);
+}
+
+async function playPcm(arrayBuffer) {
+  if (!playNode) return;
+  const i16 = new Int16Array(arrayBuffer);
+  const f32 = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+  playNode.port.postMessage({ type: "pcm", samples: f32 }, [f32.buffer]);
+  stats.rx++; stats.rxBytes += arrayBuffer.byteLength || i16.byteLength;
+}
+
+/* ---------------------------------------------------- TTS：整句 MP3 直接播放
+ * Python 推来的是 base64(MP3)。这里 decodeAudioData 会把 24k 的 edge-tts 音频
+ * 重采样到当前 AudioContext 的 48k，然后挂到 playDest 上——playDest 就是那条
+ * 常驻的 Agora 自定义音轨，所以不需要再转 PCM、也不再 republish。
+ */
+async function speakMp3(base64Data, id) {
+  if (!playCtx || !playDest) return { ok: false, error: "playback not ready" };
+  try {
+    const bin = atob(base64Data);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const buffer = await playCtx.decodeAudioData(bytes.buffer);
+    if (!joined) return { ok: false, error: "not joined" };
+
+    const src = playCtx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(playDest);
+    activeSources.add(src);
+    src.onended = () => {
+      activeSources.delete(src);
+      try { src.disconnect(); } catch (_) {}
+    };
+    src.start();
+    stats.spoken++;
+    const token = (id === null || id === undefined) ? ++speakId : id;
+    log("[speak]", token, buffer.duration.toFixed(2) + "s", "queue=" + activeSources.size);
+    return { ok: true, id: token, duration: buffer.duration };
+  } catch (e) {
+    log("[speak] failed", String(e && e.message || e));
+    return { ok: false, error: String(e && e.message || e) };
+  }
+}
+
+function flushSpeech() {
+  for (const src of Array.from(activeSources)) {
+    try { src.stop(); } catch (_) {}
+    try { src.disconnect(); } catch (_) {}
+  }
+  activeSources.clear();
+  if (playNode) playNode.port.postMessage({ type: "flush" });
+}
+
+/* --------------------------------------------------- 抓取远端的 audio track */
+function attachRemoteAudio(user) {
+  const uid = Number(user.uid);
+  if (!uid || uid === currentAgoraUid) return;
+  if (capture.has(uid)) return;
+  try {
+    const msTrack = user.audioTrack && user.audioTrack.getMediaStreamTrack
+      ? user.audioTrack.getMediaStreamTrack()
+      : null;
+    if (!msTrack) { log("[cap] no media track for", uid); return; }
+    const stream = new MediaStream([msTrack]);
+    const source = capCtx.createMediaStreamSource(stream);
+    const node = new AudioWorkletNode(capCtx, "pcm-capture");
+    source.connect(node);
+    node.connect(capSink);
+    node.port.onmessage = (e) => sendPcm(uid, e.data);
+    capture.set(uid, { source, node });
+    log("[cap] attached", uid, identity.get(uid) || "");
+  } catch (e) {
+    log("[cap] attach failed", uid, String(e && e.message || e));
+  }
+}
+
+function detachRemoteAudio(uid) {
+  const c = capture.get(Number(uid));
+  if (!c) return;
+  try { c.source.disconnect(); } catch (_) {}
+  try { c.node.disconnect(); c.node.port.close(); } catch (_) {}
+  capture.delete(Number(uid));
+  log("[cap] detached", uid);
+}
+
+function sendPcm(agoraUid, int16Buffer) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const i16 = new Int16Array(int16Buffer);
+  const buf = new ArrayBuffer(9 + i16.byteLength);
+  const dv = new DataView(buf);
+  dv.setUint8(0, 1);
+  dv.setUint32(1, (agoraUid >>> 0), true);
+  dv.setUint32(5, (seq++ >>> 0), true);
+  new Uint8Array(buf, 9).set(new Uint8Array(i16.buffer, i16.byteOffset, i16.byteLength));
+  ws.send(buf);
+  stats.tx++; stats.txBytes += i16.byteLength;
+}
+
+/* --------------------------------------------------------- Agora 事件绑定 */
+function bindClientEvents() {
+  client.on("user-published", async (user, mediaType) => {
+    if (mediaType !== "audio") return;
+    try { await client.subscribe(user, "audio"); } catch (e) { log("[sub] failed", user.uid, String(e)); return; }
+    attachRemoteAudio(user);
+  });
+
+  client.on("user-unpublished", (user) => detachRemoteAudio(user.uid));
+  client.on("user-left", (user) => {
+    detachRemoteAudio(user.uid);
+    identity.delete(Number(user.uid));
+  });
+
+  // OOPZ 客户端会周期性广播 uid<->Agora uid 的身份帧；
+  // 能收到就顺便把"谁在说话"映射出来。
+  client.on("stream-message", (uid, data) => {
+    try {
+      const text = new TextDecoder().decode(data);
+      const obj = JSON.parse(atob(text));
+      const cipher = Number(obj.cid || uid);
+      if (obj.uid && cipher) {
+        identity.set(cipher, String(obj.uid));
+        sendJson({ type: "identity", agora_uid: cipher, oopz_uid: String(obj.uid) });
+      }
+    } catch (_) { /* 不是身份帧，忽略 */ }
+  });
+
+  client.on("connection-state-change", (cur, prev) => {
+    log("[rtc]", prev, "->", cur);
+    if (cur === "DISCONNECTED" || cur === "FAILED") joined = false;
+  });
+}
+
+/* --------------------------------------------------------- Agora SDK 加载 */
+async function loadAgoraSdk() {
+  if (typeof AgoraRTC !== "undefined") return;
+  const sdkUrl = window.AGORA_SDK_URL || "https://download.agora.io/sdk/release/AgoraRTC_N.js";
+  await new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = sdkUrl;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error("Agora SDK 加载失败: " + sdkUrl));
+    document.head.appendChild(s);
+  });
+}
+
+/* -------------------------------- OOPZ data_stream 身份帧（抄自 oopz-sdk） */
+const _wsInstances = [];
+const _OrigWS = window.WebSocket;
+window.WebSocket = function (url, protocols) {
+  const w = protocols ? new _OrigWS(url, protocols) : new _OrigWS(url);
+  _wsInstances.push(w);
+  w.addEventListener("open", () => console.log("[ws open]", url));
+  return w;
+};
+window.WebSocket.prototype = _OrigWS.prototype;
+["CONNECTING", "OPEN", "CLOSING", "CLOSED"].forEach(k => window.WebSocket[k] = _OrigWS[k]);
+
+function isBridgeWs(w) {
+  return !!w && typeof w.url === "string" && w.url === WS_URL;
+}
+
+function getAgoraSignalWs() {
+  const open = _wsInstances.filter(w => w.readyState === WebSocket.OPEN && !isBridgeWs(w));
+  const edge = open.find(w => typeof w.url === "string" && w.url.includes("sd-rtn.com"));
+  return edge || open[0] || null;
+}
+
+async function waitForAgoraSignalWs(timeoutMs = 3000) {
+  const t0 = performance.now();
+  while (performance.now() - t0 < timeoutMs) {
+    const w = getAgoraSignalWs();
+    if (w) return w;
+    await new Promise(r => setTimeout(r, 50));
+  }
+  return null;
+}
+
+function buildVoiceStatePayload(oopzUid, agoraUid, micMuted, speakerMuted) {
+  return {
+    m: micMuted ? 1 : 0,
+    uid: String(oopzUid),
+    cid: Number(agoraUid),
+    hm: speakerMuted ? 1 : 0,
+  };
+}
+
+async function sendVoiceStateRaw(oopzUid, agoraUid, micMuted, speakerMuted, repeat = 2) {
+  const w = await waitForAgoraSignalWs(3000);
+  if (!w) return { ok: false, error: "no open agora ws" };
+  if (!oopzUid) return { ok: false, error: "oopzUid is required" };
+  if (agoraUid === null || agoraUid === undefined || Number.isNaN(Number(agoraUid))) {
+    return { ok: false, error: "valid agoraUid is required" };
+  }
+  try {
+    const payload = btoa(JSON.stringify(buildVoiceStatePayload(oopzUid, agoraUid, micMuted, speakerMuted)));
+    const sendTs = Math.floor(performance.now());
+    for (let i = 0; i < repeat; i++) {
+      w.send(JSON.stringify({
+        _id: Math.random().toString(16).slice(2, 8).padEnd(6, "0"),
+        _type: "data_stream",
+        _message: { payload, syncWithAudio: false, sendTs: sendTs + i * 2 },
+      }));
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message || e) };
+  }
+}
+
+window.agoraSetVoiceIdentity = async (oopzUid) => {
+  currentOopzUid = String(oopzUid);
+  if (currentAgoraUid === null) return { ok: false, error: "not joined" };
+  return await sendVoiceStateRaw(currentOopzUid, currentAgoraUid, false, false, 2);
+};
+
+/* --------------------------------------------------------------- join */
+window.agoraJoin = async (appId, token, channelName, uid) => {
+  try {
+    await connectWs();
+    await loadAgoraSdk();
+    await ensurePlayback();
+    await ensureCapture();
+
+    if (client) { try { await window.agoraLeave(); } catch (_) {} }
+
+    client = AgoraRTC.createClient({ mode: "live", codec: "vp8" });
+    await client.setClientRole("host");
+    bindClientEvents();
+
+    const wantUid = uid === null || uid === undefined ? null : Number(uid);
+    const assigned = await client.join(String(appId), String(channelName), token || null, wantUid);
+    currentAgoraUid = Number(assigned);
+
+    // 常驻一条音轨：之后所有 TTS 都往这条轨里塞 PCM，不再反复 publish
+    playTrack = AgoraRTC.createCustomAudioTrack({
+      mediaStreamTrack: playDest.stream.getAudioTracks()[0],
+    });
+    await client.publish([playTrack]);
+
+    joined = true;
+    sendJson({ type: "joined", agora_uid: currentAgoraUid, channel: String(channelName) });
+    log("[join] ok uid=", currentAgoraUid, "channel=", channelName);
+
+    if (identityTimer) clearInterval(identityTimer);
+    identityTimer = setInterval(() => {
+      if (joined && currentOopzUid && currentAgoraUid !== null) {
+        sendVoiceStateRaw(currentOopzUid, currentAgoraUid, false, false, 1);
+      }
+    }, 8000);
+
+    return { ok: true, uid: currentAgoraUid };
+  } catch (e) {
+    const msg = String(e && e.message || e);
+    log("[join] failed", msg);
+    return { ok: false, error: msg };
+  }
+};
+
+window.agoraLeave = async () => {
+  joined = false;
+  if (identityTimer) { clearInterval(identityTimer); identityTimer = null; }
+  flushSpeech();
+  for (const uid of Array.from(capture.keys())) detachRemoteAudio(uid);
+  try { if (playTrack && client) await client.unpublish([playTrack]); } catch (_) {}
+  // 注意：不要 playTrack.close()。自定义音轨 close() 可能把底层 MediaStreamTrack
+  // 一起停掉，重新进房就哑了。这里只取消发布，底层工作流留着复用。
+  playTrack = null;
+  try { if (client) await client.leave(); } catch (_) {}
+  client = null;
+  currentAgoraUid = null;
+  return { ok: true };
+};
+
+/* --------------------------------------------------------------- status */
+window.agoraGetStatus = () => ({
+  joined,
+  wsOpen: stats.wsOpen,
+  agoraUid: currentAgoraUid,
+  oopzUid: currentOopzUid,
+  captured: Array.from(capture.keys()),
+  identity: Object.fromEntries(identity),
+  speaking: activeSources.size > 0,
+  spoken: stats.spoken,
+  chunksOut: stats.tx,
+  chunksIn: stats.rx,
+  bytesOut: stats.txBytes,
+  bytesIn: stats.rxBytes,
+  outRate: OUT_RATE,
+  inRate: IN_RATE,
+});
+
+window.agoraStopSpeech = () => {
+  flushSpeech();
+  return { ok: true };
+};
+
+connectWs();
+log("[boot] page ready, ws =", WS_URL);
+})();
+</script>
+</body>
+</html>

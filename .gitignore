@@ -1,0 +1,16 @@
+# 本地凭据与运行产物，不要提交
+creds.ps1
+key.txt
+channels.txt
+err*.txt
+run.log
+doctor-report.txt
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 编辑器
+.vscode/
+.idea/
